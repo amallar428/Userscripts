@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Canvas File Bulk Downloader
 // @namespace    local.canvas.file.downloader
-// @version      3.0.0
+// @version      3.1.0
 // @homepageURL  https://github.com/amallar428/Userscripts
 // @supportURL   https://github.com/amallar428/Userscripts/issues
 // @updateURL    https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-downloader.user.js
 // @downloadURL  https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-downloader.user.js
-// @description  Browse, select, and bulk-download files from Canvas pages and modules. Scan the current page for linked files, or browse a module's file items; optionally limit to PDFs.
+// @description  Browse, select, and bulk-download files from Canvas pages, modules, and the Files tab. Scan the current page for linked files, browse a module's file items, or grab a Files folder (optionally with subfolders); optionally limit to PDFs.
 // @author       local
 // @match        https://*.instructure.com/courses/*
 // @match        https://canvas.mit.edu/courses/*
@@ -36,7 +36,8 @@
   const isPagePage = /\/courses\/\d+\/pages\//.test(path);
   const isModuleItemPage = /\/courses\/\d+\/modules\/items\/\d+/.test(path);
   const isModulesPage = /\/courses\/\d+\/modules\/?$/.test(path);
-  if (!isPagePage && !isModuleItemPage && !isModulesPage) return;
+  const isFilesPage = /\/courses\/\d+\/files(\/|$)/.test(path);
+  if (!isPagePage && !isModuleItemPage && !isModulesPage && !isFilesPage) return;
 
   // ─────────────────────────────────────────────────────────────
   // Styles
@@ -132,7 +133,7 @@
   const courseMatch = path.match(/\/courses\/(\d+)/);
   const courseId = courseMatch ? courseMatch[1] : null;
 
-  let files = [];        // { name, url, kind, fileId? }[]
+  let files = [];        // { name, url, kind, fileId?, relPath? }[]
   let isRunning = false;
   let modulesLoaded = false;
 
@@ -144,7 +145,9 @@
 
   const settings = {
     get pdfOnly() { return GM_getValue("pdfOnly", false); },
-    set pdfOnly(v) { GM_setValue("pdfOnly", !!v); }
+    set pdfOnly(v) { GM_setValue("pdfOnly", !!v); },
+    get subfolders() { return GM_getValue("subfolders", true); },
+    set subfolders(v) { GM_setValue("subfolders", !!v); }
   };
 
   // ─────────────────────────────────────────────────────────────
@@ -161,6 +164,10 @@
       .trim()
       .replace(/[. ]+$/, "")
       .slice(0, 180) || "canvas_file";
+  }
+
+  function sanitizePath(p) {
+    return String(p).split("/").map(sanitizeFilename).join("/");
   }
 
   function escHtml(s) {
@@ -258,6 +265,7 @@
 
         <div id="cfd-mode-row">
           <button type="button" class="cfd-small-btn" id="cfd-scan-page-btn">Scan current page</button>
+          <button type="button" class="cfd-small-btn" id="cfd-scan-folder-btn" style="display:none">Scan this folder</button>
           <button type="button" class="cfd-small-btn" id="cfd-load-modules-btn">Browse modules</button>
         </div>
 
@@ -269,10 +277,14 @@
           <input type="checkbox" id="cfd-pdf-only">
           <label for="cfd-pdf-only">PDFs only</label>
         </div>
+        <div class="cfd-set-row" id="cfd-subfolders-row" style="display:none">
+          <input type="checkbox" id="cfd-subfolders">
+          <label for="cfd-subfolders">Include subfolders (keeps folder structure)</label>
+        </div>
       </div>
 
       <div id="cfd-panel-body">
-        <p class="cfd-hint">Scan this page for linked files, or browse a module.</p>
+        <p class="cfd-hint">Scan this page for linked files, grab a Files folder, or browse a module.</p>
       </div>
 
       <div id="cfd-panel-footer">
@@ -285,6 +297,7 @@
 
   $("cfd-fab").addEventListener("click", () => $("cfd-panel").classList.toggle("open"));
   $("cfd-scan-page-btn").addEventListener("click", scanCurrentPage);
+  $("cfd-scan-folder-btn").addEventListener("click", scanFilesFolder);
   $("cfd-load-modules-btn").addEventListener("click", loadModules);
   $("cfd-module-select").addEventListener("change", loadSelectedModuleFiles);
   $("cfd-dl-btn").addEventListener("click", downloadSelected);
@@ -295,15 +308,41 @@
     if (files.length) renderChecklist(); // re-filter what's already collected
   });
 
+  if (isFilesPage) {
+    $("cfd-scan-page-btn").style.display = "none";
+    $("cfd-scan-folder-btn").style.display = "";
+    $("cfd-subfolders-row").style.display = "";
+    $("cfd-subfolders").checked = settings.subfolders;
+    $("cfd-subfolders").addEventListener("change", e => {
+      settings.subfolders = e.target.checked;
+      scanFilesFolder();
+    });
+  }
+
   // Pick the obvious mode for the page you're on.
   if (isModulesPage) {
     setTimeout(loadModules, 500);
+  } else if (isFilesPage) {
+    setTimeout(scanFilesFolder, 700);
   } else {
     setTimeout(scanCurrentPage, 700);
   }
 
+  // The Files tab is a single-page app: clicking into a folder changes the URL
+  // without reloading, so watch for that and rescan.
+  if (isFilesPage) {
+    let lastPath = location.pathname;
+    setInterval(() => {
+      if (location.pathname !== lastPath) {
+        lastPath = location.pathname;
+        if (!isRunning) scanFilesFolder();
+      }
+    }, 800);
+  }
+
   function setMode(mode) {
     $("cfd-scan-page-btn").classList.toggle("active", mode === "page");
+    $("cfd-scan-folder-btn").classList.toggle("active", mode === "folder");
     $("cfd-load-modules-btn").classList.toggle("active", mode === "modules");
     $("cfd-module-select").style.display = mode === "modules" ? "block" : "none";
   }
@@ -398,6 +437,83 @@
     files = collected;
     isRunning = false;
     finishCollect("No downloadable file links found on this page.");
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Files-tab folder mode
+  // ─────────────────────────────────────────────────────────────
+
+  // /courses/:id/files                      → course root folder
+  // /courses/:id/files/folder/A/B%20C       → folder at path "A/B C"
+  function currentFolderPath() {
+    const m = location.pathname.match(/\/courses\/\d+\/files(?:\/folder\/(.*))?/);
+    if (!m) return null;
+    return (m[1] || "").split("/").filter(Boolean).map(seg => {
+      try { return decodeURIComponent(seg); } catch (_) { return seg; }
+    });
+  }
+
+  async function resolveFolder(segments) {
+    const encoded = segments.map(encodeURIComponent).join("/");
+    const chain = await apiGet(`${origin}/api/v1/courses/${courseId}/folders/by_path${encoded ? "/" + encoded : ""}`);
+    if (!Array.isArray(chain) || !chain.length) throw new Error("Folder not found");
+    return chain[chain.length - 1];
+  }
+
+  // Collects files in a folder, descending into subfolders when asked.
+  // relDir is the path relative to the folder the user is looking at.
+  async function collectFolder(folder, relDir, out, seengit Folders) {
+    if (seenFolders.has(folder.id)) return;
+    seenFolders.add(folder.id);
+    setStatus(`Reading ${relDir || folder.name || "folder"}…`);
+
+    const items = await apiGetAll(`${origin}/api/v1/folders/${folder.id}/files`);
+    for (const info of items) {
+      const name = info.display_name || info.filename || `canvas_file_${info.id}`;
+      out.push({
+        name,
+        relPath: relDir ? `${relDir}/${name}` : name,
+        url: canvasDownloadUrl(info.id),
+        kind: kindOf(name, info["content-type"]),
+        fileId: String(info.id)
+      });
+    }
+
+    if (!settings.subfolders) return;
+    const subs = await apiGetAll(`${origin}/api/v1/folders/${folder.id}/folders`);
+    for (const sub of subs) {
+      await collectFolder(sub, relDir ? `${relDir}/${sub.name}` : sub.name, out, seenFolders);
+    }
+  }
+
+  async function scanFilesFolder() {
+    if (isRunning) return;
+    const segments = currentFolderPath();
+    if (segments == null || !courseId) {
+      $("cfd-panel-body").innerHTML = `<p class="cfd-hint">Open a course's Files tab to use this.</p>`;
+      return;
+    }
+
+    isRunning = true;
+    setMode("folder");
+    resetProgress();
+    files = [];
+    syncSelectionUI();
+    $("cfd-panel-body").innerHTML = `<p class="cfd-hint">⏳ Reading folder…</p>`;
+
+    try {
+      const folder = await resolveFolder(segments);
+      const collected = [];
+      await collectFolder(folder, "", collected, new Set());
+      files = collected;
+      isRunning = false;
+      finishCollect(settings.subfolders
+        ? "This folder (and its subfolders) has no files."
+        : "This folder has no files. Tick “Include subfolders” to look deeper.");
+    } catch (e) {
+      isRunning = false;
+      $("cfd-panel-body").innerHTML = `<p class="cfd-hint">❌ ${escHtml(e.message)}</p>`;
+    }
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -519,7 +635,7 @@
           <li class="cfd-file-row">
             <input type="checkbox" id="cfd-chk-${f.i}" class="cfd-chk" checked>
             <label for="cfd-chk-${f.i}">
-              ${escHtml(f.name)}
+              ${escHtml(f.relPath || f.name)}
               <span class="cfd-file-kind">${escHtml(f.kind || "")}</span>
             </label>
             <span class="cfd-st" id="cfd-st-${f.i}"></span>
@@ -590,7 +706,7 @@
         await new Promise((resolve, reject) => {
           GM_download({
             url: file.url,
-            name: sanitizeFilename(file.name),
+            name: file.relPath ? sanitizePath(file.relPath) : sanitizeFilename(file.name),
             saveAs: false,
             onload: resolve,
             onerror: e => reject(new Error((e && (e.error || e.details)) || "download error")),
