@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Canvas File Bulk Downloader
 // @namespace    local.canvas.file.downloader
-// @version      3.1.0
+// @version      3.2.0
 // @homepageURL  https://github.com/amallar428/Userscripts
 // @supportURL   https://github.com/amallar428/Userscripts/issues
-// @updateURL    https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-bulk-downloader.user.js
-// @downloadURL  https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-bulk-downloader.user.js
-// @description  Browse, select, and bulk-download files from Canvas pages, modules, and the Files tab. Scan the current page for linked files, browse a module's file items, or grab a Files folder (optionally with subfolders); optionally limit to PDFs.
+// @updateURL    https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-downloader.user.js
+// @downloadURL  https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-downloader.user.js
+// @description  Bulk-download files from Canvas pages, modules, and the Files tab straight into a folder you choose (no Save dialogs). Scan a page for linked files, browse a module or all modules (per-module subfolders or flat), or grab a Files folder with subfolders; tick what you want and let it rip. Optional PDFs-only filter.
 // @author       local
 // @match        https://*.instructure.com/courses/*
 // @match        https://canvas.mit.edu/courses/*
@@ -80,7 +80,15 @@
       font-size: 13px; color: #333; display: none; margin-bottom: 8px;
     }
 
+    #cfd-settings {
+      background: #fff7f8; border: 1px solid #f0dfe2; border-radius: 6px;
+      padding: 8px; margin-bottom: 8px; display: flex; flex-direction: column; gap: 6px;
+    }
     .cfd-set-row { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #444; }
+    .cfd-small-btn.cfd-inline { flex: 0 0 auto; }
+    #cfd-dir-label { flex: 1; color: #555; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #cfd-subfolder { flex: 1; padding: 4px 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px; }
+
     .cfd-set-row input[type=checkbox] { accent-color: #a31f34; cursor: pointer; margin: 0; }
     .cfd-set-row label { cursor: pointer; }
 
@@ -133,9 +141,15 @@
   const courseMatch = path.match(/\/courses\/(\d+)/);
   const courseId = courseMatch ? courseMatch[1] : null;
 
+  // "Folder mode" = File System Access API (Chrome / Edge / Opera): write into ANY
+  // folder you pick, no Save dialogs. Otherwise (Firefox / Safari) fall back to
+  // GM_download into a subfolder of your Downloads folder.
+  const FS_SUPPORTED = typeof window.showDirectoryPicker === "function";
+
   let files = [];        // { name, url, kind, fileId?, relPath? }[]
   let isRunning = false;
   let modulesLoaded = false;
+  let moduleList = [];   // { id, name }[] once loaded
 
   const FILE_EXTENSIONS = [
     "pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx",
@@ -147,7 +161,11 @@
     get pdfOnly() { return GM_getValue("pdfOnly", false); },
     set pdfOnly(v) { GM_setValue("pdfOnly", !!v); },
     get subfolders() { return GM_getValue("subfolders", true); },
-    set subfolders(v) { GM_setValue("subfolders", !!v); }
+    set subfolders(v) { GM_setValue("subfolders", !!v); },
+    get moduleSubfolders() { return GM_getValue("moduleSubfolders", true); },
+    set moduleSubfolders(v) { GM_setValue("moduleSubfolders", !!v); },
+    get downloadsSubfolder() { return GM_getValue("downloadsSubfolder", "Canvas"); },
+    set downloadsSubfolder(v) { GM_setValue("downloadsSubfolder", String(v || "")); }
   };
 
   // ─────────────────────────────────────────────────────────────
@@ -208,6 +226,137 @@
 
   function setStatus(text) { $("cfd-status-text").textContent = text; }
 
+  function gmFetchBlob(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: "GET", url,
+        responseType: "blob",
+        withCredentials: true,
+        timeout: 10 * 60 * 1000,
+        onload(r) {
+          if (r.status >= 200 && r.status < 300 && r.response) resolve(r.response);
+          else reject(new Error(`HTTP ${r.status}`));
+        },
+        onerror: () => reject(new Error("Network error")),
+        ontimeout: () => reject(new Error("Timed out"))
+      });
+    });
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Remembering the chosen folder (IndexedDB can store a folder handle)
+  // ─────────────────────────────────────────────────────────────
+
+  function idb() {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open("cfd-canvas-downloader", 1);
+      req.onupgradeneeded = () => req.result.createObjectStore("kv");
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbGet(key) {
+    const db = await idb();
+    return new Promise((resolve, reject) => {
+      const req = db.transaction("kv").objectStore("kv").get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  async function idbSet(key, value) {
+    const db = await idb();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction("kv", "readwrite");
+      tx.objectStore("kv").put(value, key);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function pickDirectory() {
+    const handle = await window.showDirectoryPicker({ id: "canvas-downloader", mode: "readwrite" });
+    await idbSet("dir", handle);
+    updateDirLabel(handle);
+    return handle;
+  }
+
+  async function getDirHandle(interactive) {
+    let handle = null;
+    try { handle = await idbGet("dir"); } catch (_) {}
+    if (!handle) return interactive ? pickDirectory() : null;
+
+    let perm = await handle.queryPermission({ mode: "readwrite" });
+    if (perm === "granted") return handle;
+    if (!interactive) return null;
+    perm = await handle.requestPermission({ mode: "readwrite" });
+    return perm === "granted" ? handle : null;
+  }
+
+  async function updateDirLabel(handle) {
+    const label = $("cfd-dir-label");
+    if (!label) return;
+    if (!handle) { try { handle = await idbGet("dir"); } catch (_) {} }
+    label.textContent = handle ? `📁 ${handle.name}` : "No folder chosen";
+    label.title = handle ? handle.name : "";
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // Saving a single file. Returns "saved" or "skipped"; throws on failure.
+  // ─────────────────────────────────────────────────────────────
+
+  async function saveFile(file, dirHandle) {
+    const relPath = file.relPath ? sanitizePath(file.relPath) : sanitizeFilename(file.name);
+
+    if (dirHandle) {
+      const parts = relPath.split("/");
+      const fileName = parts.pop();
+      let dir = dirHandle;
+      for (const seg of parts) dir = await dir.getDirectoryHandle(seg, { create: true });
+
+      // Already there and non-empty → skip, so re-running is cheap.
+      try {
+        const existing = await (await dir.getFileHandle(fileName)).getFile();
+        if (existing.size > 0) return "skipped";
+      } catch (_) { /* doesn't exist yet */ }
+
+      const blob = await gmFetchBlob(file.url);
+      const fh = await dir.getFileHandle(fileName, { create: true });
+      const writable = await fh.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return "saved";
+    }
+
+    // Fallback: GM_download into <Downloads>/<subfolder>/..., remembering
+    // what's been fetched by Canvas file id so re-runs skip it.
+    const doneKey = file.fileId ? `file:${file.fileId}` : null;
+    const done = GM_getValue("downloadedIds", {});
+    if (doneKey && done[doneKey]) return "skipped";
+
+    const prefix = sanitizePath(settings.downloadsSubfolder.replace(/^[\\/]+|[\\/]+$/g, ""));
+    const name = prefix ? `${prefix}/${relPath}` : relPath;
+
+    await new Promise((resolve, reject) => {
+      GM_download({
+        url: file.url, name,
+        saveAs: false,
+        conflictAction: "overwrite",
+        onload: resolve,
+        onerror: e => reject(new Error((e && (e.error || e.details)) || "download error")),
+        ontimeout: () => reject(new Error("Timed out"))
+      });
+    });
+
+    if (doneKey) {
+      const latest = GM_getValue("downloadedIds", {});
+      latest[doneKey] = Date.now();
+      GM_setValue("downloadedIds", latest);
+    }
+    return "saved";
+  }
+
   // ─────────────────────────────────────────────────────────────
   // Canvas API
   // ─────────────────────────────────────────────────────────────
@@ -263,6 +412,32 @@
       <div id="cfd-panel-header">
         <h3>📥 Canvas File Downloader</h3>
 
+        <div id="cfd-settings">
+          ${FS_SUPPORTED ? `
+            <div class="cfd-set-row">
+              <span id="cfd-dir-label">No folder chosen</span>
+              <button type="button" class="cfd-small-btn cfd-inline" id="cfd-pick-dir">Choose folder…</button>
+            </div>
+          ` : `
+            <div class="cfd-set-row">
+              <span>Downloads/</span>
+              <input id="cfd-subfolder" type="text" placeholder="Canvas">
+            </div>
+          `}
+          <div class="cfd-set-row">
+            <input type="checkbox" id="cfd-pdf-only">
+            <label for="cfd-pdf-only">PDFs only</label>
+          </div>
+          <div class="cfd-set-row" id="cfd-subfolders-row" style="display:none">
+            <input type="checkbox" id="cfd-subfolders">
+            <label for="cfd-subfolders">Include subfolders (keeps folder structure)</label>
+          </div>
+          <div class="cfd-set-row" id="cfd-module-subfolders-row" style="display:none">
+            <input type="checkbox" id="cfd-module-subfolders">
+            <label for="cfd-module-subfolders">One subfolder per module (untick for a flat download)</label>
+          </div>
+        </div>
+
         <div id="cfd-mode-row">
           <button type="button" class="cfd-small-btn" id="cfd-scan-page-btn">Scan current page</button>
           <button type="button" class="cfd-small-btn" id="cfd-scan-folder-btn" style="display:none">Scan this folder</button>
@@ -272,15 +447,6 @@
         <select id="cfd-module-select">
           <option value="">Loading modules…</option>
         </select>
-
-        <div class="cfd-set-row">
-          <input type="checkbox" id="cfd-pdf-only">
-          <label for="cfd-pdf-only">PDFs only</label>
-        </div>
-        <div class="cfd-set-row" id="cfd-subfolders-row" style="display:none">
-          <input type="checkbox" id="cfd-subfolders">
-          <label for="cfd-subfolders">Include subfolders (keeps folder structure)</label>
-        </div>
       </div>
 
       <div id="cfd-panel-body">
@@ -302,6 +468,24 @@
   $("cfd-module-select").addEventListener("change", loadSelectedModuleFiles);
   $("cfd-dl-btn").addEventListener("click", downloadSelected);
 
+  $("cfd-module-subfolders").checked = settings.moduleSubfolders;
+  $("cfd-module-subfolders").addEventListener("change", e => {
+    settings.moduleSubfolders = e.target.checked;
+    if ($("cfd-module-select").value === "__all__") loadSelectedModuleFiles();
+  });
+
+  if (FS_SUPPORTED) {
+    updateDirLabel();
+    $("cfd-pick-dir").addEventListener("click", async () => {
+      try { await pickDirectory(); } catch (e) {
+        if (e.name !== "AbortError") setStatus(`❌ Couldn't choose folder: ${e.message}`);
+      }
+    });
+  } else {
+    $("cfd-subfolder").value = settings.downloadsSubfolder;
+    $("cfd-subfolder").addEventListener("change", e => { settings.downloadsSubfolder = e.target.value.trim(); });
+  }
+
   $("cfd-pdf-only").checked = settings.pdfOnly;
   $("cfd-pdf-only").addEventListener("change", e => {
     settings.pdfOnly = e.target.checked;
@@ -319,14 +503,13 @@
     });
   }
 
-  // Pick the obvious mode for the page you're on.
-  if (isModulesPage) {
-    setTimeout(loadModules, 500);
-  } else if (isFilesPage) {
-    setTimeout(scanFilesFolder, 700);
-  } else {
-    setTimeout(scanCurrentPage, 700);
-  }
+  // Pick the obvious mode for the page you're on (lists only; nothing is
+  // downloaded until you say so).
+  setTimeout(() => {
+    if (isModulesPage) loadModules();
+    else if (isFilesPage) scanFilesFolder();
+    else scanCurrentPage();
+  }, 700);
 
   // The Files tab is a single-page app: clicking into a folder changes the URL
   // without reloading, so watch for that and rescan.
@@ -335,6 +518,7 @@
     setInterval(() => {
       if (location.pathname !== lastPath) {
         lastPath = location.pathname;
+        files = [];
         if (!isRunning) scanFilesFolder();
       }
     }, 800);
@@ -536,8 +720,10 @@
     $("cfd-panel-body").innerHTML = `<p class="cfd-hint">⏳ Loading modules…</p>`;
     try {
       const modules = await apiGetAll(`${origin}/api/v1/courses/${courseId}/modules`);
+      moduleList = modules.map(m => ({ id: m.id, name: m.name }));
       $("cfd-module-select").innerHTML =
         `<option value="">— choose a module —</option>` +
+        `<option value="__all__">All modules (one subfolder each)</option>` +
         modules.map(m =>
           `<option value="${escHtml(m.id)}">${escHtml(m.name)}${m.items_count ? ` (${m.items_count})` : ""}</option>`
         ).join("");
@@ -552,6 +738,7 @@
   async function loadSelectedModuleFiles() {
     if (isRunning) return;
     const moduleId = $("cfd-module-select").value;
+    $("cfd-module-subfolders-row").style.display = moduleId === "__all__" ? "" : "none";
     files = [];
     resetProgress();
     syncSelectionUI();
@@ -565,29 +752,46 @@
     $("cfd-panel-body").innerHTML = `<p class="cfd-hint">⏳ Loading files…</p>`;
 
     try {
-      const items = await apiGetAll(`${origin}/api/v1/courses/${courseId}/modules/${moduleId}/items?include[]=content_details`);
-      const fileItems = items.filter(item => item.type === "File" && item.content_id);
-
-      if (!fileItems.length) {
-        files = [];
-        isRunning = false;
-        $("cfd-panel-body").innerHTML = `<p class="cfd-hint">No file items found in this module.</p>`;
-        return;
-      }
+      const all = moduleId === "__all__";
+      const targets = all
+        ? moduleList.map(m => ({ id: m.id, dir: settings.moduleSubfolders ? sanitizeFilename(m.name) : "", label: m.name }))
+        : [{ id: moduleId, dir: "", label: "" }];
 
       const collected = [];
-      for (let i = 0; i < fileItems.length; i++) {
-        const item = fileItems[i];
-        setStatus(`Checking ${i + 1} / ${fileItems.length}: ${item.title || item.content_id}`);
-        try {
-          collected.push(await fileFromId(item.content_id, item.title));
-        } catch (e) {
-          console.warn("[Canvas downloader] Skipping inaccessible file:", item.title, e);
+      const seenIds = new Set();
+      const usedNames = new Set();
+      for (const t of targets) {
+        const items = await apiGetAll(`${origin}/api/v1/courses/${courseId}/modules/${t.id}/items?include[]=content_details`);
+        const fileItems = items.filter(item => item.type === "File" && item.content_id);
+        for (let i = 0; i < fileItems.length; i++) {
+          const item = fileItems[i];
+          setStatus(`${t.label ? t.label + " — " : ""}checking ${i + 1} / ${fileItems.length}: ${item.title || item.content_id}`);
+          try {
+            const f = await fileFromId(item.content_id, item.title);
+            // The same file linked from two modules: once in a flat download,
+            // once per module when using subfolders.
+            const idKey = t.dir ? `${t.dir}/${f.fileId}` : f.fileId;
+            if (seenIds.has(idKey)) continue;
+            seenIds.add(idKey);
+            // Different files with the same name in a flat download get (2), (3)…
+            let rel = t.dir ? `${t.dir}/${f.name}` : f.name;
+            if (!t.dir && all) {
+              const ext = getExtension(f.name);
+              const stem = ext ? f.name.slice(0, -(ext.length + 1)) : f.name;
+              let n = 2;
+              while (usedNames.has(rel.toLowerCase())) rel = ext ? `${stem} (${n++}).${ext}` : `${stem} (${n++})`;
+              usedNames.add(rel.toLowerCase());
+            }
+            f.relPath = rel;
+            collected.push(f);
+          } catch (e) {
+            console.warn("[Canvas downloader] Skipping inaccessible file:", item.title, e);
+          }
         }
       }
       files = collected;
       isRunning = false;
-      finishCollect("No downloadable files found in this module.");
+      finishCollect(moduleId === "__all__" ? "No file items in any module." : "No file items found in this module.");
     } catch (e) {
       isRunning = false;
       $("cfd-panel-body").innerHTML = `<p class="cfd-hint">❌ ${escHtml(e.message)}</p>`;
@@ -674,47 +878,58 @@
 
     const btn = $("cfd-dl-btn");
     btn.disabled = n === 0 || isRunning;
-    btn.textContent = n === 0 ? "⬇️ Download selected" : `⬇️ Download ${n} file${n !== 1 ? "s" : ""}`;
+    btn.textContent = n === 0 ? "⬇️ Download selected" : `⬇️ Download ${n} file${n !== 1 ? "s" : ""} to folder`;
   }
 
   // ─────────────────────────────────────────────────────────────
   // Downloading
   // ─────────────────────────────────────────────────────────────
 
+  // Uses the remembered folder, or asks you to pick one the first time.
+  async function acquireDir() {
+    if (!FS_SUPPORTED) return { ok: true, dirHandle: null };
+    try {
+      const dirHandle = await getDirHandle(true);
+      if (dirHandle) return { ok: true, dirHandle };
+    } catch (e) {
+      if (e.name !== "AbortError") setStatus(`❌ Folder access failed: ${e.message}`);
+      return { ok: false };
+    }
+    $("cfd-panel").classList.add("open");
+    setStatus("Folder permission was not granted.");
+    return { ok: false };
+  }
+
   async function downloadSelected() {
     if (isRunning) return;
-
     const selected = visibleFiles().filter(({ i }) => {
       const chk = $(`cfd-chk-${i}`);
       return chk && chk.checked;
     });
     if (!selected.length) return;
 
+    const { ok, dirHandle } = await acquireDir();
+    if (!ok) return;
+    await runDownloads(selected, dirHandle);
+  }
+
+  async function runDownloads(list, dirHandle) {
     isRunning = true;
     syncSelectionUI();
     $("cfd-progress-wrap").style.display = "block";
     $("cfd-progress-bar").style.width = "0%";
 
-    let done = 0, saved = 0, failed = 0;
+    let done = 0, saved = 0, skipped = 0, failed = 0;
 
-    for (const file of selected) {
+    for (const file of list) {
       const st = $(`cfd-st-${file.i}`);
       if (st) st.textContent = "⬇️";
-      setStatus(`Downloading ${done + 1} / ${selected.length}: ${file.name}`);
+      setStatus(`Downloading ${done + 1} / ${list.length}: ${file.relPath || file.name}`);
 
       try {
-        await new Promise((resolve, reject) => {
-          GM_download({
-            url: file.url,
-            name: file.relPath ? sanitizePath(file.relPath) : sanitizeFilename(file.name),
-            saveAs: false,
-            onload: resolve,
-            onerror: e => reject(new Error((e && (e.error || e.details)) || "download error")),
-            ontimeout: () => reject(new Error("Timed out"))
-          });
-        });
-        saved++;
-        if (st) st.textContent = "✅";
+        const result = await saveFile(file, dirHandle);
+        if (result === "skipped") { skipped++; if (st) { st.textContent = "⏭️"; st.title = "Already there"; } }
+        else { saved++; if (st) st.textContent = "✅"; }
       } catch (e) {
         failed++;
         console.error("[Canvas downloader] Download failed:", file.name, e);
@@ -722,11 +937,11 @@
       }
 
       done++;
-      $("cfd-progress-bar").style.width = `${Math.round((done / selected.length) * 100)}%`;
-      await sleep(600);
+      $("cfd-progress-bar").style.width = `${Math.round((done / list.length) * 100)}%`;
+      await sleep(dirHandle ? 150 : 600);
     }
 
-    setStatus(`Done — ${saved} downloaded${failed ? `, ${failed} failed (hover ❌ for details)` : ""}.`);
+    setStatus(`Done — ${saved} saved, ${skipped} already there${failed ? `, ${failed} failed (hover ❌ for details)` : ""}.`);
     isRunning = false;
     syncSelectionUI();
   }
