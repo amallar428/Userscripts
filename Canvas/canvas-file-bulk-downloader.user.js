@@ -4,8 +4,8 @@
 // @version      3.1.0
 // @homepageURL  https://github.com/amallar428/Userscripts
 // @supportURL   https://github.com/amallar428/Userscripts/issues
-// @updateURL    https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-downloader.user.js
-// @downloadURL  https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-downloader.user.js
+// @updateURL    https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-bulk-downloader.user.js
+// @downloadURL  https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-bulk-downloader.user.js
 // @description  Browse, select, and bulk-download files from Canvas pages, modules, and the Files tab. Scan the current page for linked files, browse a module's file items, or grab a Files folder (optionally with subfolders); optionally limit to PDFs.
 // @author       local
 // @match        https://*.instructure.com/courses/*
@@ -462,7 +462,7 @@
 
   // Collects files in a folder, descending into subfolders when asked.
   // relDir is the path relative to the folder the user is looking at.
-  async function collectFolder(folder, relDir, out, seengit Folders) {
+  async function collectFolder(folder, relDir, out, seenFolders) {
     if (seenFolders.has(folder.id)) return;
     seenFolders.add(folder.id);
     setStatus(`Reading ${relDir || folder.name || "folder"}…`);
