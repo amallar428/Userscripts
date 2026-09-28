@@ -4,8 +4,8 @@
 // @version      3.2.0
 // @homepageURL  https://github.com/amallar428/Userscripts
 // @supportURL   https://github.com/amallar428/Userscripts/issues
-// @updateURL    https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-downloader.user.js
-// @downloadURL  https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-downloader.user.js
+// @updateURL    https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-bulk-downloader.user.js
+// @downloadURL  https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-bulk-downloader.user.js
 // @description  Bulk-download files from Canvas pages, modules, and the Files tab straight into a folder you choose (no Save dialogs). Scan a page for linked files, browse a module or all modules (per-module subfolders or flat), or grab a Files folder with subfolders; tick what you want and let it rip. Optional PDFs-only filter.
 // @author       local
 // @match        https://*.instructure.com/courses/*
