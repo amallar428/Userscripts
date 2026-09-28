@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         Canvas File Bulk Downloader
 // @namespace    local.canvas.file.downloader
-// @version      3.2.0
+// @version      3.4.0
 // @homepageURL  https://github.com/amallar428/Userscripts
 // @supportURL   https://github.com/amallar428/Userscripts/issues
-// @updateURL    https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-bulk-downloader.user.js
-// @downloadURL  https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-bulk-downloader.user.js
+// @updateURL    https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-downloader.user.js
+// @downloadURL  https://raw.githubusercontent.com/amallar428/Userscripts/main/Canvas/canvas-file-downloader.user.js
 // @description  Bulk-download files from Canvas pages, modules, and the Files tab straight into a folder you choose (no Save dialogs). Scan a page for linked files, browse a module or all modules (per-module subfolders or flat), or grab a Files folder with subfolders; tick what you want and let it rip. Optional PDFs-only filter.
 // @author       local
 // @match        https://*.instructure.com/courses/*
@@ -723,7 +723,7 @@
       moduleList = modules.map(m => ({ id: m.id, name: m.name }));
       $("cfd-module-select").innerHTML =
         `<option value="">— choose a module —</option>` +
-        `<option value="__all__">All modules (one subfolder each)</option>` +
+        `<option value="__all__">All modules on this page (recursive)</option>` +
         modules.map(m =>
           `<option value="${escHtml(m.id)}">${escHtml(m.name)}${m.items_count ? ` (${m.items_count})` : ""}</option>`
         ).join("");
@@ -748,52 +748,154 @@
       return;
     }
 
+    if (moduleId === "__all__") return scanAllModules();
+
     isRunning = true;
     $("cfd-panel-body").innerHTML = `<p class="cfd-hint">⏳ Loading files…</p>`;
 
     try {
-      const all = moduleId === "__all__";
-      const targets = all
-        ? moduleList.map(m => ({ id: m.id, dir: settings.moduleSubfolders ? sanitizeFilename(m.name) : "", label: m.name }))
-        : [{ id: moduleId, dir: "", label: "" }];
+      const items = await apiGetAll(`${origin}/api/v1/courses/${courseId}/modules/${moduleId}/items?include[]=content_details`);
+      const fileItems = items.filter(item => item.type === "File" && item.content_id);
 
       const collected = [];
-      const seenIds = new Set();
-      const usedNames = new Set();
-      for (const t of targets) {
-        const items = await apiGetAll(`${origin}/api/v1/courses/${courseId}/modules/${t.id}/items?include[]=content_details`);
-        const fileItems = items.filter(item => item.type === "File" && item.content_id);
-        for (let i = 0; i < fileItems.length; i++) {
-          const item = fileItems[i];
-          setStatus(`${t.label ? t.label + " — " : ""}checking ${i + 1} / ${fileItems.length}: ${item.title || item.content_id}`);
-          try {
-            const f = await fileFromId(item.content_id, item.title);
-            // The same file linked from two modules: once in a flat download,
-            // once per module when using subfolders.
-            const idKey = t.dir ? `${t.dir}/${f.fileId}` : f.fileId;
-            if (seenIds.has(idKey)) continue;
-            seenIds.add(idKey);
-            // Different files with the same name in a flat download get (2), (3)…
-            let rel = t.dir ? `${t.dir}/${f.name}` : f.name;
-            if (!t.dir && all) {
-              const ext = getExtension(f.name);
-              const stem = ext ? f.name.slice(0, -(ext.length + 1)) : f.name;
-              let n = 2;
-              while (usedNames.has(rel.toLowerCase())) rel = ext ? `${stem} (${n++}).${ext}` : `${stem} (${n++})`;
-              usedNames.add(rel.toLowerCase());
-            }
-            f.relPath = rel;
-            collected.push(f);
-          } catch (e) {
-            console.warn("[Canvas downloader] Skipping inaccessible file:", item.title, e);
-          }
+      for (let i = 0; i < fileItems.length; i++) {
+        const item = fileItems[i];
+        setStatus(`Checking ${i + 1} / ${fileItems.length}: ${item.title || item.content_id}`);
+        try {
+          collected.push(await fileFromId(item.content_id, item.title));
+        } catch (e) {
+          console.warn("[Canvas downloader] Skipping inaccessible file:", item.title, e);
         }
       }
       files = collected;
       isRunning = false;
-      finishCollect(moduleId === "__all__" ? "No file items in any module." : "No file items found in this module.");
+      finishCollect("No file items found in this module.");
     } catch (e) {
       isRunning = false;
+      $("cfd-panel-body").innerHTML = `<p class="cfd-hint">❌ ${escHtml(e.message)}</p>`;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // All modules on this page, recursively
+  // ─────────────────────────────────────────────────────────────
+
+  // Modules as rendered on /modules: <div class="context_module" id="context_module_123">
+  // with items <li class="context_module_item ..." id="context_module_item_456">.
+  // Reading the DOM means "what you see is what you get"; the API is only the
+  // fallback if the page is somehow empty.
+  function modulesOnPage() {
+    const out = [];
+    document.querySelectorAll('.context_module[id^="context_module_"]').forEach(el => {
+      const id = el.id.replace("context_module_", "");
+      if (!/^\d+$/.test(id)) return;
+      const nameEl = el.querySelector(".ig-header-title .name, .ig-header-title, .name");
+      const name = (el.getAttribute("aria-label") || (nameEl && nameEl.textContent) || `Module ${id}`).trim();
+      const itemIds = Array.from(el.querySelectorAll('.context_module_item[id^="context_module_item_"]'))
+        .map(li => li.id.replace("context_module_item_", ""))
+        .filter(x => /^\d+$/.test(x));
+      out.push({ id, name, itemIds });
+    });
+    return out;
+  }
+
+  // Files linked from inside a Canvas Page (wiki page) body.
+  async function filesInPage(pageUrl) {
+    const page = await apiGet(`${origin}/api/v1/courses/${courseId}/pages/${encodeURIComponent(pageUrl)}`);
+    const doc = new DOMParser().parseFromString(page.body || "", "text/html");
+    const ids = new Set();
+    doc.querySelectorAll("a[href], img[src]").forEach(el => {
+      const id = extractCanvasFileId(el.getAttribute("href") || el.getAttribute("src") || "");
+      if (id) ids.add(id);
+    });
+    return { title: page.title || pageUrl, fileIds: Array.from(ids) };
+  }
+
+  async function scanAllModules() {
+    if (isRunning) return;
+    isRunning = true;
+    resetProgress();
+    files = [];
+    syncSelectionUI();
+    $("cfd-panel-body").innerHTML = `<p class="cfd-hint">⏳ Walking every module on this page…</p>`;
+
+    const collected = [];
+    const seenIds = new Set();
+    const usedNames = new Set();
+    let itemErrors = 0;
+
+    function add(f, dir) {
+      const idKey = dir ? `${dir}/${f.fileId}` : f.fileId;
+      if (seenIds.has(idKey)) return;
+      seenIds.add(idKey);
+      let rel = dir ? `${dir}/${f.name}` : f.name;
+      if (!dir) {
+        // Flat: different files sharing a name get (2), (3)…
+        const ext = getExtension(f.name);
+        const stem = ext ? f.name.slice(0, -(ext.length + 1)) : f.name;
+        let n = 2;
+        while (usedNames.has(rel.toLowerCase())) rel = ext ? `${stem} (${n++}).${ext}` : `${stem} (${n++})`;
+        usedNames.add(rel.toLowerCase());
+      }
+      f.relPath = rel;
+      collected.push(f);
+    }
+
+    try {
+      let modules = modulesOnPage();
+      if (!modules.length) {
+        // Not on /modules (or the page hasn't rendered them): fall back to the API list.
+        if (!moduleList.length) {
+          const apiModules = await apiGetAll(`${origin}/api/v1/courses/${courseId}/modules`);
+          moduleList = apiModules.map(m => ({ id: m.id, name: m.name }));
+        }
+        modules = moduleList.map(m => ({ id: String(m.id), name: m.name, itemIds: null }));
+      }
+
+      for (let mi = 0; mi < modules.length; mi++) {
+        const mod = modules[mi];
+        const dir = settings.moduleSubfolders ? sanitizeFilename(mod.name) : "";
+
+        // Item ids from the DOM, or from the API when the DOM had none.
+        let items;
+        if (mod.itemIds && mod.itemIds.length) {
+          items = mod.itemIds.map(id => ({ id }));
+        } else {
+          items = await apiGetAll(`${origin}/api/v1/courses/${courseId}/modules/${mod.id}/items`);
+        }
+
+        for (let ii = 0; ii < items.length; ii++) {
+          setStatus(`Module ${mi + 1} / ${modules.length} “${mod.name}” — item ${ii + 1} / ${items.length}`);
+          try {
+            // A DOM-sourced item only has an id; fetch its details.
+            const item = items[ii].type ? items[ii]
+              : await apiGet(`${origin}/api/v1/courses/${courseId}/modules/items/${items[ii].id}`);
+
+            if (item.type === "File" && item.content_id) {
+              add(await fileFromId(item.content_id, item.title), dir);
+            } else if (item.type === "Page" && item.page_url) {
+              // Recurse one level: files linked from inside the page.
+              const { title, fileIds } = await filesInPage(item.page_url);
+              for (const fid of fileIds) {
+                try { add(await fileFromId(fid, title), dir); }
+                catch (e) { itemErrors++; console.warn("[Canvas downloader] file in page failed:", title, fid, e); }
+              }
+            }
+            // Assignments, quizzes, external links etc. are skipped.
+          } catch (e) {
+            itemErrors++;
+            console.warn("[Canvas downloader] module item failed:", mod.name, items[ii].id, e);
+          }
+        }
+      }
+
+      files = collected;
+      isRunning = false;
+      finishCollect("No files in any module on this page.");
+      if (itemErrors) setStatus(`${$("cfd-status-text").textContent} ${itemErrors} item(s) couldn't be read (see console).`);
+    } catch (e) {
+      isRunning = false;
+      console.error("[Canvas downloader] scanAllModules failed:", e);
       $("cfd-panel-body").innerHTML = `<p class="cfd-hint">❌ ${escHtml(e.message)}</p>`;
     }
   }
