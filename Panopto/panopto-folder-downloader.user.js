@@ -221,21 +221,125 @@
     return response.json();
   }
 
-  function gmFetchBlob(url) {
+  function gmRequest(opts) {
     return new Promise((resolve, reject) => {
       GM_xmlhttpRequest({
-        method: "GET", url,
-        responseType: "blob",
         withCredentials: true,
         timeout: 30 * 60 * 1000,
+        ...opts,
         onload(r) {
-          if (r.status >= 200 && r.status < 300 && r.response) resolve(r.response);
+          if (r.status >= 200 && r.status < 300) resolve(r);
           else reject(new Error(`HTTP ${r.status}`));
         },
         onerror: () => reject(new Error("Network error")),
         ontimeout: () => reject(new Error("Timed out"))
       });
     });
+  }
+
+  async function withRetry(fn, tries = 3) {
+    let lastErr;
+    for (let i = 0; i < tries; i++) {
+      try { return await fn(); } catch (e) { lastErr = e; await sleep(500 * (i + 1)); }
+    }
+    throw lastErr;
+  }
+
+  const gmFetchBlob   = url => gmRequest({ method: "GET", url, responseType: "blob" }).then(r => r.response);
+  const gmFetchText   = url => gmRequest({ method: "GET", url, responseType: "text" }).then(r => r.responseText);
+  const gmFetchBuffer = url => withRetry(() => gmRequest({ method: "GET", url, responseType: "arraybuffer" }).then(r => r.response));
+
+  // Panopto exposes a real MP4 at this URL when the course allows downloads.
+  async function probeDirectMp4(sessionId) {
+    const url = `${origin}/Panopto/Podcast/Download/${sessionId}.mp4?mediaTargetType=videoPodcast`;
+    try {
+      const r = await gmRequest({ method: "HEAD", url, timeout: 20_000 });
+      const ct = (/content-type:\s*([^\r\n]+)/i.exec(r.responseHeaders || "") || [])[1] || "";
+      if (/video|octet-stream/i.test(ct)) return r.finalUrl || url;
+    } catch (_) {}
+    return null;
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // HLS (m3u8) → single file
+  // ─────────────────────────────────────────────────────────────
+
+  function parseAttrs(line) {
+    const attrs = {};
+    const re = /([A-Z0-9-]+)=("([^"]*)"|[^,]*)/g;
+    let m;
+    while ((m = re.exec(line))) attrs[m[1]] = m[3] != null ? m[3] : m[2];
+    return attrs;
+  }
+
+  // Resolves master → best variant → list of segments. Returns { init, segs, isFmp4 }.
+  async function resolveHls(masterUrl) {
+    let text = await gmFetchText(masterUrl);
+    let playlistUrl = masterUrl;
+
+    if (text.includes("#EXT-X-STREAM-INF")) {
+      const lines = text.split(/\r?\n/);
+      let best = null;
+      for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].startsWith("#EXT-X-STREAM-INF")) continue;
+        const bw = parseInt(parseAttrs(lines[i]).BANDWIDTH || "0", 10);
+        let j = i + 1;
+        while (j < lines.length && (!lines[j].trim() || lines[j].startsWith("#"))) j++;
+        if (j < lines.length && (!best || bw > best.bw)) best = { bw, uri: lines[j].trim() };
+      }
+      if (!best) throw new Error("No variant streams in master playlist");
+      playlistUrl = new URL(best.uri, masterUrl).href;
+      text = await gmFetchText(playlistUrl);
+    }
+
+    const segs = [];
+    let init = null, pendingKey = null, seq = 0;
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) seq = parseInt(line.split(":")[1], 10) || 0;
+      else if (line.startsWith("#EXT-X-MAP:")) init = new URL(parseAttrs(line).URI, playlistUrl).href;
+      else if (line.startsWith("#EXT-X-KEY:")) {
+        const a = parseAttrs(line);
+        pendingKey = a.METHOD === "NONE" ? null : { method: a.METHOD, uri: a.URI ? new URL(a.URI, playlistUrl).href : null, iv: a.IV };
+      }
+      else if (!line.startsWith("#")) segs.push({ url: new URL(line, playlistUrl).href, key: pendingKey, seq: seq + segs.length });
+    }
+    if (!segs.length) throw new Error("Playlist has no segments");
+
+    const isFmp4 = !!init || /\.(m4s|mp4)(\?|$)/i.test(segs[0].url);
+    return { init, segs, isFmp4 };
+  }
+
+  const keyCache = new Map();
+  async function decryptSegment(buf, seg) {
+    if (!seg.key) return buf;
+    if (seg.key.method !== "AES-128") throw new Error(`Unsupported encryption: ${seg.key.method}`);
+    let raw = keyCache.get(seg.key.uri);
+    if (!raw) { raw = await gmFetchBuffer(seg.key.uri); keyCache.set(seg.key.uri, raw); }
+    const cryptoKey = await crypto.subtle.importKey("raw", raw, { name: "AES-CBC" }, false, ["decrypt"]);
+    let iv;
+    if (seg.key.iv) {
+      const hex = seg.key.iv.replace(/^0x/i, "").padStart(32, "0");
+      iv = new Uint8Array(hex.match(/../g).map(h => parseInt(h, 16)));
+    } else {
+      iv = new Uint8Array(16);
+      new DataView(iv.buffer).setUint32(12, seg.seq);
+    }
+    return crypto.subtle.decrypt({ name: "AES-CBC", iv }, cryptoKey, buf);
+  }
+
+  // Pulls all segments (4 at a time, written in order) through writeChunk(ArrayBuffer).
+  async function downloadHls(resolved, writeChunk, onProgress) {
+    const { init, segs } = resolved;
+    if (init) await writeChunk(await gmFetchBuffer(init));
+    const POOL = 4;
+    for (let i = 0; i < segs.length; i += POOL) {
+      const batch = segs.slice(i, i + POOL);
+      const bufs = await Promise.all(batch.map(s => gmFetchBuffer(s.url).then(b => decryptSegment(b, s))));
+      for (const b of bufs) await writeChunk(b);
+      onProgress(Math.min(i + POOL, segs.length), segs.length);
+    }
   }
 
   // ─────────────────────────────────────────────────────────────
@@ -410,7 +514,18 @@
 
   // Returns "saved" or "skipped". Throws on failure.
   async function saveFile(file, dirHandle) {
-    const relPath = sanitizePath(file.relPath || file.name);
+    let relPath = sanitizePath(file.relPath || file.name);
+
+    // HLS: resolve the playlist first so we know the real container
+    // (.mp4 for fMP4 segments, .ts for MPEG-TS segments).
+    let hls = null;
+    if (file.hls) {
+      hls = await resolveHls(file.url);
+      if (!hls.isFmp4) relPath = relPath.replace(/\.mp4$/i, ".ts");
+    }
+
+    const progress = (done, total) =>
+      setStatus(`Downloading ${file.name} — segment ${done} / ${total}`);
 
     if (dirHandle) {
       const parts = relPath.split("/");
@@ -424,11 +539,17 @@
         if (existing.size > 0 && !file.overwrite) return "skipped";
       } catch (_) { /* doesn't exist yet */ }
 
-      const blob = await fileToBlob(file);
       const fh = await dir.getFileHandle(fileName, { create: true });
       const writable = await fh.createWritable();
-      await writable.write(blob);
-      await writable.close();
+      try {
+        if (hls) await downloadHls(hls, chunk => writable.write(chunk), progress);
+        else await writable.write(await fileToBlob(file));
+        await writable.close();
+      } catch (e) {
+        try { await writable.abort(); } catch (_) {}
+        try { await dir.removeEntry(fileName); } catch (_) {}
+        throw e;
+      }
       return "saved";
     }
 
@@ -444,6 +565,12 @@
     let revoke = null;
     if (file.text != null) {
       url = URL.createObjectURL(new Blob([file.text], { type: "text/plain" }));
+      revoke = url;
+    } else if (hls) {
+      // No streaming target here, so assemble in memory then hand to GM_download.
+      const chunks = [];
+      await downloadHls(hls, chunk => { chunks.push(chunk); }, progress);
+      url = URL.createObjectURL(new Blob(chunks, { type: hls.isFmp4 ? "video/mp4" : "video/mp2t" }));
       revoke = url;
     }
 
@@ -605,7 +732,6 @@
 
     const collected = [];
     const usedPaths = new Set();
-    const hlsLinks = [];
 
     for (let i = 0; i < sessions.length; i++) {
       const s = sessions[i];
@@ -627,8 +753,12 @@
       usedPaths.add(`${folderTitle}/${base}`.toLowerCase());
 
       if (isHls(info.streamUrl)) {
-        hlsLinks.push(`${info.streamUrl}\t${base}`);
-        collected.push({ name: base, sessionId: s.id, kind: "HLS", error: "HLS-only stream; link saved to panopto_hls_links.txt", relPath: `${folderTitle}/${base}.mp4` });
+        const direct = await probeDirectMp4(s.id);
+        if (direct) {
+          collected.push({ name: base, sessionId: s.id, kind: "MP4", url: direct, relPath: `${folderTitle}/${base}.mp4`, sub: folderTitle });
+        } else {
+          collected.push({ name: base, sessionId: s.id, kind: "MP4", hls: true, url: info.streamUrl, relPath: `${folderTitle}/${base}.mp4`, sub: `${folderTitle} · assembled from HLS` });
+        }
       } else {
         collected.push({ name: base, sessionId: s.id, kind: "MP4", url: info.streamUrl, relPath: `${folderTitle}/${base}.mp4`, sub: folderTitle });
       }
@@ -637,14 +767,6 @@
         const suffix = info.captions.length > 1 ? `.${c.lang}` : "";
         collected.push({ name: `${base}${suffix}`, sessionId: s.id, kind: "TXT", text: captionsToTxt(c.entries), relPath: `${folderTitle}/${base}${suffix}.txt`, sub: folderTitle });
       }
-    }
-
-    if (hlsLinks.length) {
-      collected.push({
-        name: "panopto_hls_links", kind: "TXT", overwrite: true,
-        text: hlsLinks.map(l => l.split("\t")[0]).join("\n") + "\n",
-        relPath: `${folderTitle}/panopto_hls_links.txt`, sub: folderTitle
-      });
     }
 
     return collected;
@@ -747,7 +869,7 @@
       </div>
       <ul id="ppd-file-list">
         ${files.map((f, i) => {
-          const disabled = f.kind === "ERROR" || f.kind === "HLS";
+          const disabled = f.kind === "ERROR";
           return `
           <li class="ppd-file-row">
             <input type="checkbox" id="ppd-chk-${i}" class="ppd-chk" ${disabled ? "disabled" : "checked"}>
@@ -834,7 +956,7 @@
 
     for (const file of list) {
       const st = $(`ppd-st-${file.i}`);
-      if (file.kind === "ERROR" || file.kind === "HLS") { done++; continue; }
+      if (file.kind === "ERROR") { done++; continue; }
 
       if (st) st.textContent = "⬇️";
       setStatus(`Downloading ${done + 1} / ${list.length}: ${file.name}.${file.kind.toLowerCase()}`);
@@ -854,8 +976,7 @@
       await sleep(dirHandle ? 150 : 500);
     }
 
-    const hls = list.filter(f => f.kind === "HLS").length;
-    setStatus(`Done — ${saved} saved, ${skipped} already there${failed ? `, ${failed} failed (see ❌)` : ""}${hls ? `, ${hls} HLS-only (links in panopto_hls_links.txt)` : ""}.`);
+    setStatus(`Done — ${saved} saved, ${skipped} already there${failed ? `, ${failed} failed (see ❌)` : ""}.`);
     isRunning = false;
     syncSelectionUI();
   }
