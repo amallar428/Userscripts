@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bulk Panopto Folder Downloader
 // @namespace    local.panopto.folder.downloader
-// @version      1.0.0
+// @version      1.1.0
 // @homepageURL  https://github.com/amallar428/Userscripts
 // @supportURL   https://github.com/amallar428/Userscripts/issues
 // @updateURL    https://raw.githubusercontent.com/amallar428/Userscripts/main/Panopto/panopto-folder-downloader.user.js
